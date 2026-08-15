@@ -1,0 +1,42 @@
+{
+  "name": "systemlocker-simple",
+  "version": "0.1.0",
+  "description": "Official System Locker Simple client for Node.js. Performs stateless license checks over POST /auth, for software on machines you control.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/systemlocker/System-Locker-Simple-NodeJS.git"
+  },
+  "keywords": [
+    "systemlocker",
+    "licensing",
+    "authentication",
+    "license-verification"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "./index.cjs",
+  "types": "./index.d.cts",
+  "exports": {
+    ".": {
+      "import": "./index.mjs",
+      "require": "./index.cjs",
+      "default": "./index.cjs"
+    },
+    "./hwid": {
+      "import": "./hwid/index.mjs",
+      "require": "./hwid/index.cjs",
+      "default": "./hwid/index.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.cjs",
+    "index.mjs",
+    "index.d.cts",
+    "src/",
+    "hwid/",
+    "README.md",
+    "SECURITY.md"
+  ]
+}
