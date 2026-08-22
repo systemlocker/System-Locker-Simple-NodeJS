@@ -60,6 +60,36 @@ Wraps `POST /api/v1`: key status/expiration, HWID resets (single/admin or
 whole-system), key generation, bans, expiry adjustment. Keep the API key on
 servers you control.
 
+## Google SSO (account authentication)
+
+Accounts created through Google sign-in have no local password on the
+server. A `username`/`password` check for such an account fails with an
+`sso`, `ssoexp`, or `ssowrong` reason that embeds the portal URL where the
+user completes Google sign-in and receives a system-specific password
+(valid 180 days) to use as their account password. There is no callback;
+the user transcribes the generated password into your login form and you
+simply retry.
+
+Deliver the portal link to your user through your own channel (API response, email, chat).
+
+```js
+try {
+	await client.authenticateWithPassword(username, password);
+} catch (error) {
+	if (error instanceof simple.SimpleError && error.kind === simple.ErrorKind.SSO) {
+		// sso / ssoexp / ssowrong — the portal URL is embedded in the error.
+		const portal = simple.ssoLink(error);
+		sendToUser(user, portal); // your channel: API response, email, chat…
+		return;
+	}
+	throw error; // any other denial
+}
+```
+
+`simple.googleSsoUrl(systemId)` (or `client.googleSsoUrl()`) builds the
+same portal URL before any denial, if you already know the account signs in
+through Google.
+
 ## Device identifiers (HWID)
 
 The library derives a hardware ID by default. To provide your own stable ID:

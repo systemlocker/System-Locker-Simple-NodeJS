@@ -1,6 +1,7 @@
 'use strict';
 
 const { SimpleError, ErrorKind, classify } = require('./errors');
+const { googleSsoUrl } = require('./sso');
 
 const AUTH_PATH = '/auth';
 const VARIABLE_PATH = '/auth/variable';
@@ -103,6 +104,11 @@ class Client {
   /** Checks username + password credentials (goliath mode). */
   async authenticateWithPassword(username, password) {
     return this.authenticate({ ...(await this.baseFields()), username, password });
+  }
+
+  /** Returns the Google SSO portal URL for the configured system. */
+  googleSsoUrl() {
+    return googleSsoUrl(this.config.systemId);
   }
 
   async authenticate(fields) {
