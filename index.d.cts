@@ -5,6 +5,7 @@ declare namespace Simple {
     | 'Server'
     | 'Denied'
     | 'SSO'
+    | 'LocalFailure'
     | 'UnknownReason';
 
   class SimpleError extends Error {
@@ -27,6 +28,9 @@ declare namespace Simple {
     systemId: string;
     version: string;
     hwid?: string;
+    hwidMode?: 'legacy' | 'sl-hwid';
+    slHwidStore?: string | null;
+    slHwidExtraMandatory?: string[] | null;
     requestTimeoutMs?: number;
     baseUrl?: string;
     userAgent?: string;

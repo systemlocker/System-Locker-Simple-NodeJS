@@ -17,9 +17,12 @@ function defaultConfig() {
     systemId: '',
     version: '',
     hwid: null,
+    hwidMode: 'legacy',
+    slHwidStore: null,
+    slHwidExtraMandatory: null,
     requestTimeoutMs: 15_000,
     baseUrl: 'https://systemlocker.net',
-    userAgent: 'systemlocker-simple-node/0.1',
+    userAgent: 'systemlocker-simple-node/0.2',
     programDigest: null,
     apiKey: null,
   };
@@ -36,6 +39,9 @@ class Client {
    */
   constructor(config = {}, options = {}) {
     const merged = { ...defaultConfig(), ...config };
+    if (merged.hwidMode !== undefined && merged.hwidMode !== 'legacy' && merged.hwidMode !== 'sl-hwid') {
+      throw new SimpleError(ErrorKind.Configuration, 'HWID mode must be "legacy" or "sl-hwid".');
+    }
     if (!merged.systemId) {
       throw new SimpleError(ErrorKind.Configuration, 'System ID must not be empty.');
     }
@@ -66,14 +72,59 @@ class Client {
       : this.config.baseUrl + path;
   }
 
+  /**
+   * Recovers (or enrolls) the shared SL-HWID device identity. The promise is
+   * cached so concurrent requests share one preparation; the resolved
+   * session is kept for the post-authentication commit.
+   */
+  async _prepareSlHwid() {
+    this._slHwidSession ??= (async () => {
+      const options = {
+        storePath: this.config.slHwidStore ?? undefined,
+        extraMandatory: this.config.slHwidExtraMandatory ?? undefined,
+      };
+      try {
+        return await (Client._slHwidPrepare ?? require('../hwid/slhwid.cjs').prepare)(options);
+      } catch (error) {
+        this._slHwidSession = undefined; // a later call may retry after a local failure
+        throw new SimpleError(ErrorKind.LocalFailure, `SL-HWID unavailable: ${error.message}`);
+      }
+    })();
+    return this._slHwidSession;
+  }
+
+  /** Re-centers the SL-HWID shares after the server accepted an
+   * authentication. Best-effort: the next launch re-derives. */
+  async _commitSlHwid() {
+    if (!this._slHwidSession) {
+      return;
+    }
+    try {
+      const session = await this._slHwidSession;
+      await session.commit();
+    } catch {
+      // non-fatal by design
+    }
+  }
+
   async baseFields() {
-    if (this.config.hwid === null || this.config.hwid === '') {
-      this.config.hwid = await require('../hwid/collect.cjs').deviceHwid();
+    let hwid = this.config.hwid;
+    if (hwid === null || hwid === '') {
+      if (this.config.hwidMode !== 'legacy') { // 'sl-hwid' is opt-in
+        hwid = (await this._prepareSlHwid()).hwid;
+      } else {
+        try {
+          this.config.hwid = await require('../hwid/collect.cjs').deviceHwid();
+        } catch (error) {
+          throw new SimpleError(ErrorKind.Configuration, `Could not derive the default hardware ID: ${error.message}. Supply a custom HWID or use "1" to disable device checks.`);
+        }
+        hwid = this.config.hwid;
+      }
     }
     const fields = {
       system: this.config.systemId,
       version: this.config.version,
-      hwid: this.config.hwid,
+      hwid,
       clean: '1',
     };
     if (this.config.programDigest) {
@@ -114,6 +165,8 @@ class Client {
   async authenticate(fields) {
     const { body } = await this.request(AUTH_PATH, fields);
     if (body === 'true') {
+      // The server accepted this identity on this device.
+      await this._commitSlHwid();
       return true;
     }
     throw classify(body);

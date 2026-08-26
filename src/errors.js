@@ -7,6 +7,7 @@ const ErrorKind = Object.freeze({
   Server: 'Server',
   Denied: 'Denied',
   SSO: 'SSO',
+  LocalFailure: 'LocalFailure',
   UnknownReason: 'UnknownReason',
 });
 
