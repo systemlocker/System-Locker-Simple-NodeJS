@@ -22,8 +22,10 @@ function defaultConfig() {
     slHwidExtraMandatory: null,
     requestTimeoutMs: 15_000,
     baseUrl: 'https://systemlocker.net',
-    userAgent: 'systemlocker-simple-node/0.2',
+    invisibleFolderBaseUrl: 'https://invisiblefolder.net',
+    userAgent: 'systemlocker-simple-node/1.0.0',
     programDigest: null,
+    invisibleFolderApiKey: null,
     apiKey: null,
   };
 }
@@ -261,6 +263,15 @@ class Client {
       this._management = new Management(this);
     }
     return this._management;
+  }
+
+  /** The Invisible Folder module (GET downloads and metadata). */
+  invisibleFolder() {
+    if (this._invisibleFolder === undefined) {
+      const { InvisibleFolder } = require('./invisible-folder');
+      this._invisibleFolder = new InvisibleFolder(this);
+    }
+    return this._invisibleFolder;
   }
 }
 

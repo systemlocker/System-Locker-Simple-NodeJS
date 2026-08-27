@@ -2,8 +2,7 @@
 
 ## Threat model
 
-Simple assumes the machine performing the check is **friendly** (Threat
-Model 2): you control where the client runs. The protocol is stateless —
+Simple assumes the machine performing the check is **friendly** you control where the client runs. The protocol is stateless —
 one request, one answer — and intentionally does not sign responses. Anyone
 who can intercept traffic or read this process's memory can forge a result;
 if that matters for your deployment, use a **Bedrock** client, which

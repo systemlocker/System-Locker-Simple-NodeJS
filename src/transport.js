@@ -1,27 +1,24 @@
 'use strict';
 
-const { SimpleError, ErrorKind } = require('./errors');
-
 /**
  * HTTP transport mirroring the Bedrock client's shape so tests can reuse
- * fakes: postForm(url, form, headers) → { status, body, headers, error? }.
+ * fakes: postForm(url, form, headers) and get(url, headers) →
+ * { status, body, headers, error? }.
  */
 class FetchHttpClient {
+  /**
+   * @param {{ requestTimeoutMs?: number, userAgent?: string }} options
+   */
   constructor(options = {}) {
     this.requestTimeoutMs = options.requestTimeoutMs ?? 15_000;
-    this.userAgent = options.userAgent ?? 'systemlocker-simple-node/0.1';
+    this.userAgent = options.userAgent ?? 'systemlocker-simple-node/1.0.0';
   }
 
-  async postForm(url, form, headers = {}) {
+  async _execute(method, url, { form = null, headers = {} } = {}) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.requestTimeoutMs);
     try {
-      const fetchOptions = {
-        method: 'POST',
-        headers: { ...headers },
-        signal: controller.signal,
-        redirect: 'manual',
-      };
+      const fetchOptions = { method, headers: { ...headers }, signal: controller.signal, redirect: 'manual' };
       if (this.userAgent) {
         fetchOptions.headers['User-Agent'] = this.userAgent;
       }
@@ -41,6 +38,23 @@ class FetchHttpClient {
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  /**
+   * @param {string} url
+   * @param {Record<string, string|string[]>} form
+   * @param {Record<string, string>} [headers]
+   */
+  postForm(url, form, headers = {}) {
+    return this._execute('POST', url, { form, headers });
+  }
+
+  /**
+   * @param {string} url
+   * @param {Record<string, string>} [headers]
+   */
+  get(url, headers = {}) {
+    return this._execute('GET', url, { headers });
   }
 }
 

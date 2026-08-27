@@ -22,6 +22,7 @@ declare namespace Simple {
 
   interface HTTPClient {
     postForm(url: string, form: Record<string, string | string[]>, headers?: Record<string, string>): Promise<HttpResponse>;
+    get(url: string, headers?: Record<string, string>): Promise<HttpResponse>;
   }
 
   interface SimpleConfig {
@@ -33,8 +34,10 @@ declare namespace Simple {
     slHwidExtraMandatory?: string[] | null;
     requestTimeoutMs?: number;
     baseUrl?: string;
+    invisibleFolderBaseUrl?: string;
     userAgent?: string;
     programDigest?: string | null;
+    invisibleFolderApiKey?: string | null;
     apiKey?: string | null;
   }
 
@@ -60,6 +63,51 @@ declare namespace Simple {
     resetHwidForKey(licenseKey: string): Promise<ResetOutcome>;
     resetHwidForPassword(username: string, password: string): Promise<ResetOutcome>;
     management(): Management;
+    invisibleFolder(): InvisibleFolder;
+  }
+
+  /** Selects how an Invisible Folder download authorizes against the file's
+   * protection; the empty object downloads a public or hidden file. Fill in
+   * exactly one mode. */
+  interface InvisibleFolderCredential {
+    filePassword?: string;
+    licenseKey?: string;
+    username?: string;
+    password?: string;
+  }
+
+  interface InvisibleFolderMetadataValue {
+    value: string;
+    createdAt: string | null;
+  }
+
+  interface InvisibleFolderMetadata {
+    file: {
+      id: string;
+      referenceId: string;
+      name: string;
+      mimeType: string;
+      size: number;
+      downloads: number;
+      uploadedAt: string;
+      permissionTypeId: number;
+    };
+    values: Record<string, InvisibleFolderMetadataValue>;
+  }
+
+  interface DownloadIfNewResult {
+    downloaded: boolean;
+    revision: string;
+    metadata: InvisibleFolderMetadata;
+    bytes?: Buffer;
+    destination?: string;
+  }
+
+  class InvisibleFolder {
+    download(referenceId: string, credential?: InvisibleFolderCredential): Promise<Buffer>;
+    downloadToFile(referenceId: string, destination: string, credential?: InvisibleFolderCredential): Promise<string>;
+    metadata(referenceId: string, keys?: string[]): Promise<InvisibleFolderMetadata>;
+    downloadIfNew(referenceId: string, knownRevision?: string, destination?: string, credential?: InvisibleFolderCredential): Promise<DownloadIfNewResult>;
   }
 
   type KeyExpiry = '0' | '1' | '2' | '3' | '4' | '5';
