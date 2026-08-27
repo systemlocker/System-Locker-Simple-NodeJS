@@ -154,6 +154,7 @@ function parseRegBinary(output, name) {
 class RegistryStore {
   constructor() {
     this.lockDir = localLockDirectory();
+    this.selectedRoot = null;
   }
 
   async withLock(operation) {
@@ -165,25 +166,41 @@ class RegistryStore {
     }
   }
 
-  async readValue(name) {
-    for (const root of [REG_ROOT_HKLM, REG_ROOT_HKCU]) {
-      const { error, stdout } = await run('reg', ['query', root, '/v', name, '/reg:64']);
-      if (!error) {
-        const data = parseRegBinary(stdout, name);
-        if (data) {
-          return data;
-        }
-      }
-    }
-    return null;
+  async readAt(root, name) {
+    const { error, stdout } = await run('reg', ['query', root, '/v', name, '/reg:64']);
+    return error ? null : parseRegBinary(stdout, name);
+  }
+
+  async selectRoot(helperName = '') {
+    if (this.selectedRoot) return this.selectedRoot;
+    const [lmHelper, lmStore, cuHelper, cuStore] = await Promise.all([
+      helperName ? this.readAt(REG_ROOT_HKLM, helperName) : null,
+      this.readAt(REG_ROOT_HKLM, 'SLStore'),
+      helperName ? this.readAt(REG_ROOT_HKCU, helperName) : null,
+      this.readAt(REG_ROOT_HKCU, 'SLStore'),
+    ]);
+    // A helper and SLStore form one generation. Prefer a complete HKLM pair,
+    // then complete HKCU; never satisfy a helper from one hive with the other.
+    if ((helperName && lmHelper && lmStore) || (!helperName && lmStore)) this.selectedRoot = REG_ROOT_HKLM;
+    else if ((helperName && cuHelper && cuStore) || (!helperName && cuStore)) this.selectedRoot = REG_ROOT_HKCU;
+    else if (lmHelper || lmStore) this.selectedRoot = REG_ROOT_HKLM;
+    else if (cuHelper || cuStore) this.selectedRoot = REG_ROOT_HKCU;
+    return this.selectedRoot;
+  }
+
+  async readValue(name, helperName = '') {
+    const root = await this.selectRoot(helperName);
+    return root ? this.readAt(root, name) : null;
   }
 
   async writeValue(name, data) {
-    for (const root of [REG_ROOT_HKLM, REG_ROOT_HKCU]) {
+    const selected = await this.selectRoot();
+    for (const root of selected ? [selected] : [REG_ROOT_HKLM, REG_ROOT_HKCU]) {
       const { error } = await run('reg', [
         'add', root, '/v', name, '/t', 'REG_BINARY', '/d', data.toString('hex'), '/f', '/reg:64',
       ]);
       if (!error) {
+        this.selectedRoot = root;
         return true;
       }
     }
@@ -212,7 +229,8 @@ class RegistryStore {
   }
 
   async readHelper(helperId) {
-    const blob = await this.readValue(`HWID-${helperId}`);
+    const name = `HWID-${helperId}`;
+    const blob = await this.readValue(name, name);
     return { blob, found: blob !== null };
   }
 

@@ -150,17 +150,20 @@ function threshold(n, m) {
 // ── normalization ───────────────────────────────────────────────────
 
 const PLACEHOLDERS = new Set([
-  '',
-  'none',
-  'unknown',
-  'default string',
-  'to be filled by o.e.m.',
-  'not specified',
-  'system serial number',
+  '', '0', 'none', 'unknown', 'default', 'default string', 'to be filled by o.e.m.',
+  'not specified', 'not available', 'not applicable', 'not present', 'n/a', 'na', 'null',
+  'system serial number', 'asset tag', 'no asset tag', '123456789', '0123456789', 'example',
+]);
+
+const IDENTIFIER_FACTORS = new Set([
+  'machine_guid', 'product_uuid', 'system_uuid', 'board_serial', 'system_serial', 'chassis_serial',
+  'disk_serial', 'volume_id', 'tpm_ek', 'memory_modules', 'nic_identity', 'battery_serial', 'monitor_edid',
 ]);
 
 function normalize(name, raw) {
-  let value = String(raw).replace(/\0/g, '').trim().toLowerCase();
+  // The contract intentionally lowercases ASCII only. Unicode hardware text
+  // remains byte-stable across native and managed clients.
+  let value = String(raw).replace(/\0/g, '').trim().replace(/[A-Z]/g, (c) => c.toLowerCase());
   if (name === 'mac' || name === 'nic_identity') {
     value = value.replace(/[:\-]/g, '');
   }
@@ -171,11 +174,33 @@ function isMissing(value) {
   return PLACEHOLDERS.has(value.trim());
 }
 
+function isHex(value) { return /^[0-9a-fA-F]*$/.test(value); }
+function isDegenerateIdentifier(value) {
+  const compact = [...value].filter((c) => /[A-Za-z0-9]/.test(c));
+  return compact.length >= 4 && (compact.every((c) => c === '0') || compact.every((c) => c === 'f'));
+}
+function isUuidLike(value) {
+  const validLength = value.length === 32 || (value.length === 36 && value[8] === '-' && value[13] === '-' && value[18] === '-' && value[23] === '-');
+  const compact = value.replace(/-/g, '');
+  return validLength && compact.length === 32 && isHex(compact) && !isDegenerateIdentifier(compact)
+    && compact !== '12345678123412341234123456789abc';
+}
+function isSaneFactor(name, value) {
+  if (value.length === 0 || Buffer.byteLength(value, 'utf8') > 4096 || isMissing(value)) return false;
+  if (name === 'ram_total') return /^\d+$/.test(value) && BigInt(value) >= 134217728n;
+  if (['machine_guid', 'product_uuid', 'system_uuid'].includes(name)) return isUuidLike(value);
+  if (name === 'slstore') return value.length === 64 && isHex(value) && !isDegenerateIdentifier(value);
+  if (name === 'tpm_ek') return value.length === 64 && isHex(value);
+  if (name === 'mac' || name === 'nic_identity') return value.split('|').every((part) => part.length === 12 && isHex(part) && !isDegenerateIdentifier(part));
+  if (IDENTIFIER_FACTORS.has(name)) return value.split('|').every((part) => !isMissing(part) && !isDegenerateIdentifier(part));
+  return true;
+}
+
 function normalizeFactors(raw) {
   const out = {};
   for (const [name, value] of Object.entries(raw)) {
     const nv = normalize(name, value);
-    if (nv && !isMissing(nv)) {
+    if (isSaneFactor(name, nv)) {
       out[name] = nv;
     }
   }
@@ -342,6 +367,11 @@ function serializeHelper(shares, mandatory, t, salt, cw, normVersion = CURRENT_N
 
 function parseHelper(blob) {
   const corrupt = (why) => new CorruptHelperError(`slhwid: stored helper data is corrupt: ${why}`);
+  // This is writable local state: cap it before hashing/parsing so a corrupt
+  // store cannot turn recovery into an allocation or combinatorics attack.
+  if (blob.length > 4096) {
+    throw corrupt('oversized');
+  }
   if (blob.length < 8 + 4 + 8 + 32 + 32) {
     throw corrupt('truncated');
   }
@@ -353,7 +383,7 @@ function parseHelper(blob) {
     throw corrupt('integrity mismatch');
   }
   const payloadLen = blob.readUInt32LE(8);
-  if (12 + payloadLen + 64 !== blob.length) {
+  if (payloadLen < 8 || payloadLen > 4096 || 12 + payloadLen + 64 !== blob.length) {
     throw corrupt('length mismatch');
   }
   const body = blob.subarray(12, 12 + payloadLen);
@@ -364,10 +394,25 @@ function parseHelper(blob) {
   if (body[1] !== LEGACY_NORM_VERSION && body[1] !== CURRENT_NORM_VERSION) {
     throw corrupt(`unsupported factor schema ${body[1]}`);
   }
+  if (body[6] !== 0 || body[7] !== 0) {
+    throw corrupt('reserved header bits set');
+  }
+  const allowed = new Set(body[1] === LEGACY_NORM_VERSION
+    ? LEGACY_FACTOR_NAMES
+    : [...CURRENT_DIRECT_FACTOR_NAMES, ...CURRENT_FACTOR_GROUPS.map(([name]) => name)]);
   const helper = { normVersion: body[1], salt: body[2], threshold: body[5], checkWord: cw, slots: [] };
   const n = body[3];
+  const mandatoryHeader = body[4];
+  if (n === 0 || n > allowed.size) {
+    throw corrupt('invalid slot count');
+  }
+  if (helper.threshold === 0 || helper.threshold > n || mandatoryHeader === 0 || mandatoryHeader >= helper.threshold) {
+    throw corrupt('invalid threshold');
+  }
   let offset = 8;
   const seen = new Set();
+  let previous = '';
+  let mandatoryCount = 0;
   for (let i = 0; i < n; i++) {
     if (offset + 1 > body.length) {
       throw corrupt('slot truncated');
@@ -377,11 +422,20 @@ function parseHelper(blob) {
       throw corrupt('slot truncated');
     }
     const name = body.toString('ascii', offset + 1, offset + 1 + nameLen);
-    if (seen.has(name)) {
-      throw corrupt(`duplicate slot ${name}`);
+    if (!allowed.has(name)) {
+      throw corrupt(`invalid slot ${name}`);
+    }
+    if (seen.has(name) || (previous && previous >= name)) {
+      throw corrupt(`duplicate or unsorted slot ${name}`);
     }
     seen.add(name);
-    const mandatory = (body[offset + 1 + nameLen] & 1) === 1;
+    previous = name;
+    const flags = body[offset + 1 + nameLen];
+    if (flags !== 0 && flags !== 1) {
+      throw corrupt('invalid slot flags');
+    }
+    const mandatory = flags === 1;
+    if (mandatory) mandatoryCount++;
     const share = [];
     for (let limb = 0; limb < 4; limb++) {
       const value = body.readBigUInt64LE(offset + 2 + nameLen + limb * 8);
@@ -395,6 +449,12 @@ function parseHelper(blob) {
   }
   if (offset !== body.length) {
     throw corrupt('trailing bytes');
+  }
+  if (mandatoryCount !== mandatoryHeader) {
+    throw corrupt('mandatory count mismatch');
+  }
+  if (!helper.slots.some((slot) => slot.name === 'slstore' && slot.mandatory)) {
+    throw corrupt('mandatory slstore missing');
   }
   return helper;
 }

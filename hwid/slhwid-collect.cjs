@@ -16,11 +16,18 @@ const DISPLAY_CLASS_GUID = '{4d36e968-e325-11ce-bfc1-08002be10318}';
 
 function run(command, args, timeoutMs = 3000) {
   return new Promise((resolve) => {
-    execFile(
+    const child = execFile(
       command,
       args,
-      { timeout: timeoutMs, windowsHide: true, maxBuffer: 8 * 1024 * 1024 },
-      (error, stdout) => resolve({ error, stdout: stdout ?? '' }),
+      { timeout: timeoutMs, windowsHide: true, maxBuffer: 1024 * 1024 },
+      (error, stdout) => {
+        // execFile only terminates its direct child. Providers may have their
+        // own children, so close the complete Windows process tree on timeout.
+        if (error?.killed && process.platform === 'win32') {
+          execFile('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, timeout: 2000 });
+        }
+        resolve({ error, stdout: stdout ?? '' });
+      },
     );
   });
 }
@@ -117,14 +124,6 @@ async function volumeSerial() {
   return matches ? matches[matches.length - 1] : '';
 }
 
-async function wmicColumn(entity, column) {
-  const { stdout } = await run('wmic', [entity, 'get', column], 8000);
-  return stdout
-    .split('\n')
-    .map((line) => line.trim())
-    .filter((line) => line && line.toLowerCase() !== column.toLowerCase());
-}
-
 async function collectWindows() {
   const factors = {};
   try {
@@ -173,20 +172,6 @@ async function collectWindows() {
     factors.monitor_edid = edid;
   }
 
-  const serials = await wmicColumn('diskdrive', 'SerialNumber'); // wmic is slow; 8s timeout inside
-  const disk = multiInstance(serials);
-  if (disk) {
-    factors.disk_serial = disk;
-  }
-
-  const totals = await wmicColumn('ComputerSystem', 'TotalPhysicalMemory');
-  if (totals.length > 0) {
-    const digits = (totals[0].match(/\d+/) || [])[0];
-    if (digits) {
-      factors.ram_total = digits;
-    }
-  }
-
   const volume = await volumeSerial();
   if (volume) {
     factors.volume_id = volume;
@@ -211,7 +196,10 @@ async function collectWindows() {
     "$ek=Get-TpmEndorsementKeyInfo -HashAlgorithm Sha256;if($ek.IsPresent){Emit 'tpm_ek' $ek.PublicKeyHash}",
   ].join(';');
   const v2 = await run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], 12000);
-  Object.assign(factors, namedLines(v2.stdout));
+  for (const [name, value] of Object.entries(namedLines(v2.stdout))) {
+    // CIM is optional enrichment; it must not replace a native/base slot.
+    factors[name] ??= value;
+  }
 
   return factors;
 }
