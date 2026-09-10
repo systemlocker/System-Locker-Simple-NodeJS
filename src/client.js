@@ -23,7 +23,7 @@ function defaultConfig() {
     requestTimeoutMs: 15_000,
     baseUrl: 'https://systemlocker.net',
     invisibleFolderBaseUrl: 'https://invisiblefolder.net',
-    userAgent: 'systemlocker-simple-node/1.0.0',
+    userAgent: 'systemlocker-simple-node/1.1.0',
     programDigest: null,
     invisibleFolderApiKey: null,
     apiKey: null,

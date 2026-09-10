@@ -176,20 +176,45 @@ async function prepareWith(options, collect, source, store) {
     throw new DriftError(result.present, result.needed, result.missing, result.reason === 'mandatory');
   }
   const currentFactors = projectFactors(rawFactors, CURRENT_NORM_VERSION);
+  // A second application must not weaken a hard lock selected by the
+  // application that enrolled the shared device helper.
   const storedMandatory = mapMandatoryToCurrent(helper.slots
     .filter((slot) => slot.mandatory)
     .map((slot) => slot.name));
+  const additionalMandatory = mapMandatoryToCurrent(requestedMandatory);
+  for (const name of storedMandatory) {
+    additionalMandatory.delete(name);
+  }
+  // Promoting an enrolled optional slot must not absorb a change to it.
+  // Newly available slots are bound after authorization by Commit.
+  const changed = mapMandatoryToCurrent(result.dead);
+  const unavailable = [...additionalMandatory]
+    .filter((name) => !currentFactors[name] || changed.has(name))
+    .sort();
+  if (unavailable.length > 0) {
+    let present = 0;
+    for (const slot of helper.slots) {
+      if (recoveryFactors[slot.name]) {
+        present += 1;
+      }
+    }
+    throw new DriftError(present, helper.threshold, unavailable, true);
+  }
+  for (const name of additionalMandatory) {
+    storedMandatory.add(name);
+  }
+  if (additionalMandatory.size > 0 && storedMandatory.size >= Object.keys(currentFactors).length) {
+    throw new SsError('slhwid: mandatory slots must be fewer than total factors');
+  }
   const session = new Session(
     result.hwid,
     false,
     result.dead,
-    result.pending || helper.normVersion !== CURRENT_NORM_VERSION,
+    result.pending || helper.normVersion !== CURRENT_NORM_VERSION || additionalMandatory.size > 0,
   );
   session._key = result.key;
   session._draw = new Draw(randomness);
   session._factors = currentFactors;
-  // A second application must not weaken a hard lock selected by the
-  // application that enrolled the shared device helper.
   session._mandatory = storedMandatory;
   session._store = theStore;
   session._expectedHelper = Buffer.from(storedBlob);

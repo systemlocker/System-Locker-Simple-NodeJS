@@ -527,9 +527,14 @@ function findRecoveringSubset(mandatory, optional, t, cw) {
   let found = null;
   for (const combo of combinations(optional.length, need)) {
     const points = mandatory.concat(combo.map((i) => optional[i]));
-    if (found === null && ctEqual(Buffer.from(checkWord(keyFromPoints(points))), cw)) {
+    // Keep doing the cryptographic work after the first match; skipping the
+    // remaining combinations would leak the matching subset's position.
+    const candidate = Buffer.from(checkWord(keyFromPoints(points)));
+    const matches = ctEqual(candidate, cw);
+    if (matches && found === null) {
       found = { points, chosen: new Set(combo.map((i) => optional[i].name)) };
     }
+    candidate.fill(0);
   }
   return found;
 }
@@ -590,7 +595,8 @@ function recoverCore(blob, factors) {
       const merged = mandatory.concat(optional).filter((p) => p.name !== ms.name);
       const mand2 = merged.filter((p) => isMandatorySlot(helper, p.name));
       const opt2 = merged.filter((p) => !isMandatorySlot(helper, p.name));
-      if (culprit === '' && findRecoveringSubset(mand2, opt2, t, helper.checkWord)) {
+      const recovers = findRecoveringSubset(mand2, opt2, t, helper.checkWord) !== null;
+      if (recovers && culprit === '') {
         culprit = ms.name;
       }
     }
@@ -616,9 +622,12 @@ function recoverCore(blob, factors) {
       continue;
     }
     const xq = deriveX(slot.name, value, helper.salt);
-    const onCurve = [0, 1, 2, 3].every(
-      (limb) => evaluateAt(xs, found.points.map((p) => p.share[limb]), xq) === slot.share[limb],
-    );
+    // Constant work: `&` (not `&&`) so every limb is evaluated and timing
+    // does not reveal which limb first disagreed.
+    let onCurve = 1;
+    for (const limb of [0, 1, 2, 3]) {
+      onCurve = onCurve & (evaluateAt(xs, found.points.map((p) => p.share[limb]), xq) === slot.share[limb]);
+    }
     (onCurve ? live : dead).push(slot.name);
   }
   live.sort();
