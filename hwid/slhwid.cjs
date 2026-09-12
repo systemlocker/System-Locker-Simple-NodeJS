@@ -206,11 +206,16 @@ async function prepareWith(options, collect, source, store) {
   if (additionalMandatory.size > 0 && storedMandatory.size >= Object.keys(currentFactors).length) {
     throw new SsError('slhwid: mandatory slots must be fewer than total factors');
   }
+  // A newly readable optional source also needs a post-authorization
+  // refresh, even if every previously enrolled share still matches.
+  const enrolledSlots = new Set(helper.slots.map((slot) => slot.name));
+  const addedFactors = helper.normVersion === CURRENT_NORM_VERSION &&
+    Object.keys(currentFactors).some((name) => !enrolledSlots.has(name));
   const session = new Session(
     result.hwid,
     false,
     result.dead,
-    result.pending || helper.normVersion !== CURRENT_NORM_VERSION || additionalMandatory.size > 0,
+    result.pending || helper.normVersion !== CURRENT_NORM_VERSION || additionalMandatory.size > 0 || addedFactors,
   );
   session._key = result.key;
   session._draw = new Draw(randomness);

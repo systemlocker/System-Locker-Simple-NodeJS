@@ -199,7 +199,13 @@ function isSaneFactor(name, value) {
 function normalizeFactors(raw) {
   const out = {};
   for (const [name, value] of Object.entries(raw)) {
-    const nv = normalize(name, value);
+    let nv = normalize(name, value);
+    if (name === 'memory_modules' && Buffer.byteLength(nv, 'utf8') <= 4096) {
+      // A module with an OEM placeholder must not erase the usable RAM
+      // serials beside it. Preserve order and duplicates so previously
+      // accepted inventories keep exactly the same enrolled value.
+      nv = nv.split('|').filter((part) => isSaneFactor(name, part)).join('|');
+    }
     if (isSaneFactor(name, nv)) {
       out[name] = nv;
     }

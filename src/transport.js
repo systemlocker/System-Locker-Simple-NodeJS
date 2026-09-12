@@ -11,7 +11,7 @@ class FetchHttpClient {
    */
   constructor(options = {}) {
     this.requestTimeoutMs = options.requestTimeoutMs ?? 15_000;
-    this.userAgent = options.userAgent ?? 'systemlocker-simple-node/1.1.0';
+    this.userAgent = options.userAgent ?? 'systemlocker-simple-node/1.2.0';
   }
 
   async _execute(method, url, { form = null, headers = {} } = {}) {
