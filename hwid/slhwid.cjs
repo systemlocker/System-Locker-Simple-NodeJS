@@ -128,7 +128,7 @@ async function prepareWith(options, collect, source, store) {
 
   if (!found || options.forceReenroll) {
     if (!rawFactors.slstore) {
-      rawFactors.slstore = await ensureSlstore(theStore, randomness);
+      rawFactors.slstore = await ensureSlstore(theStore, randomness, Boolean(options.forceReenroll));
     }
     const factors = projectFactors(rawFactors, CURRENT_NORM_VERSION);
     const mandatory = mapMandatoryToCurrent(requestedMandatory);
@@ -231,13 +231,25 @@ async function withStoreLock(store, operation) {
   return typeof store.withLock === 'function' ? store.withLock(operation) : operation();
 }
 
-async function ensureSlstore(store, source) {
-  const existing = await store.readSlstore();
-  if (existing) {
-    if (existing.length !== 32) {
-      throw new CorruptHelperError('slhwid: store secret has the wrong size');
+// Only runs on the enrollment path (no helper, or forceReenroll). A malformed
+// secret is never replaced implicitly, but an explicit forceReenroll discards
+// it with the rest of the device state; refusing that too would leave no
+// recovery path short of deleting the store by hand.
+async function ensureSlstore(store, source, forceReenroll = false) {
+  let existing;
+  try {
+    existing = await store.readSlstore();
+  } catch (error) {
+    if (!forceReenroll || !(error instanceof CorruptHelperError)) {
+      throw error;
     }
+    existing = null;
+  }
+  if (existing && existing.length === 32) {
     return existing.toString('hex');
+  }
+  if (existing && !forceReenroll) {
+    throw new CorruptHelperError('slhwid: store secret has the wrong size');
   }
   const value = source(32);
   if (value.length !== 32) {

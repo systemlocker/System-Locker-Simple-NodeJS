@@ -21,7 +21,7 @@ class SimpleError extends Error {
 }
 
 const KNOWN_DENIED_REASONS = new Set([
-  'no username', 'no password', 'no key', 'no sys', 'no hwid', 'false',
+  'NIGHTFLYER_LEASE_ACTIVE', 'no version', 'no username', 'no password', 'no key', 'no sys', 'no hwid', 'false',
   'not verified', 'bad u/p', 'bad key', 'bad keys', 'frozen', 'paused',
   'destitute', 'user limit', 'hwid banned', 'spoofsuspected', 'hwid',
   'expired key', 'outdated', 'digest', 'exp err big', 'no var',

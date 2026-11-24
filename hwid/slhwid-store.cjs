@@ -43,6 +43,11 @@ function readLock(lockPath) {
   }
 }
 
+function wellFormedSlstore(data) {
+  return Boolean(data) && data.length === SLSTORE_PREFIX.length + 32
+    && data.subarray(0, SLSTORE_PREFIX.length).equals(SLSTORE_PREFIX);
+}
+
 function processIsAlive(pid) {
   if (!pid) {
     return false;
@@ -56,13 +61,26 @@ function processIsAlive(pid) {
   }
 }
 
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
 function removeIfUnchanged(lockPath, expected) {
-  try {
-    if (fs.readFileSync(lockPath, 'utf8') === expected) {
-      fs.unlinkSync(lockPath);
+  // On Windows, deleting fails while another process is reading the marker.
+  // Giving up would leave a marker that names a live process, so retry
+  // briefly; the contents check stops if another process replaced it.
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    try {
+      if (fs.readFileSync(lockPath, 'utf8') === expected) {
+        fs.unlinkSync(lockPath);
+      }
+      return;
+    } catch (error) {
+      if (error.code === 'ENOENT') {
+        return; // a concurrent release/replacement needs no action
+      }
+      sleepSync(10);
     }
-  } catch {
-    /* A concurrent release/replacement needs no action. */
   }
 }
 
@@ -72,6 +90,7 @@ async function acquireLock(directory) {
   const token = crypto.randomBytes(16).toString('hex');
   const contents = LOCK_HEADER + '\n' + process.pid + '\n' + token + '\n';
   const deadline = Date.now() + LOCK_WAIT_MS;
+  let deniedAttempts = 0;
 
   for (;;) {
     try {
@@ -83,6 +102,14 @@ async function acquireLock(directory) {
       }
       return () => removeIfUnchanged(lockPath, contents);
     } catch (error) {
+      // Windows reports a marker that another process is deleting as
+      // "access denied" instead of "exists". That state lasts milliseconds;
+      // a persistent denial is a real permission error.
+      if ((error.code === 'EPERM' || error.code === 'EACCES') && deniedAttempts < 20) {
+        deniedAttempts += 1;
+        await sleep(10);
+        continue;
+      }
       if (error.code !== 'EEXIST') {
         throw new Error('slhwid: cannot acquire storage lock: ' + error.message);
       }
@@ -91,7 +118,10 @@ async function acquireLock(directory) {
     const existing = readLock(lockPath);
     if (existing && existing.contents !== null) {
       let stale = existing.pid !== null && !processIsAlive(existing.pid);
-      if (existing.pid === null) {
+      // A live-looking PID can belong to an unrelated process after PID
+      // reuse, or to a holder that failed to delete its marker. Holders keep
+      // it for milliseconds, so an old marker is abandoned either way.
+      if (!stale) {
         try {
           stale = Date.now() - fs.statSync(lockPath).mtimeMs >= UNKNOWN_LOCK_GRACE_MS;
         } catch {
@@ -181,8 +211,18 @@ class RegistryStore {
     ]);
     // A helper and SLStore form one generation. Prefer a complete HKLM pair,
     // then complete HKCU; never satisfy a helper from one hive with the other.
-    if ((helperName && lmHelper && lmStore) || (!helperName && lmStore)) this.selectedRoot = REG_ROOT_HKLM;
-    else if ((helperName && cuHelper && cuStore) || (!helperName && cuStore)) this.selectedRoot = REG_ROOT_HKCU;
+    // Only a well-formed secret completes a generation: a malformed HKLM
+    // secret that a non-elevated forceReenroll could not overwrite must not
+    // outrank the replacement it wrote to HKCU.
+    const lmValid = wellFormedSlstore(lmStore);
+    const cuValid = wellFormedSlstore(cuStore);
+    // A user hive holding the machine's own secret is a per-user copy of the
+    // machine generation (same key and HWID) written by a process that
+    // cannot update HKLM. That copy is the one this user can keep refreshed.
+    const mirror = lmValid && cuValid && lmStore.equals(cuStore);
+    if (mirror && (!helperName || (lmHelper && cuHelper))) this.selectedRoot = REG_ROOT_HKCU;
+    else if ((helperName && lmHelper && lmValid) || (!helperName && lmValid)) this.selectedRoot = REG_ROOT_HKLM;
+    else if ((helperName && cuHelper && cuValid) || (!helperName && cuValid)) this.selectedRoot = REG_ROOT_HKCU;
     else if (lmHelper || lmStore) this.selectedRoot = REG_ROOT_HKLM;
     else if (cuHelper || cuStore) this.selectedRoot = REG_ROOT_HKCU;
     return this.selectedRoot;
@@ -193,14 +233,30 @@ class RegistryStore {
     return root ? this.readAt(root, name) : null;
   }
 
+  async writeAt(root, name, data) {
+    const { error } = await run('reg', [
+      'add', root, '/v', name, '/t', 'REG_BINARY', '/d', data.toString('hex'), '/f', '/reg:64',
+    ]);
+    return !error;
+  }
+
   async writeValue(name, data) {
     const selected = await this.selectRoot();
     for (const root of selected ? [selected] : [REG_ROOT_HKLM, REG_ROOT_HKCU]) {
-      const { error } = await run('reg', [
-        'add', root, '/v', name, '/t', 'REG_BINARY', '/d', data.toString('hex'), '/f', '/reg:64',
-      ]);
-      if (!error) {
+      if (await this.writeAt(root, name, data)) {
         this.selectedRoot = root;
+        return true;
+      }
+    }
+    if (selected === REG_ROOT_HKLM) {
+      // A non-elevated process cannot update an HKLM generation that an
+      // elevated one created. Continue in HKCU instead of never absorbing
+      // drift again: copying the machine secret first makes the user hive a
+      // complete mirror with the same key, so the HWID is kept.
+      const secret = name === 'SLStore' ? null : await this.readAt(REG_ROOT_HKLM, 'SLStore');
+      if ((name === 'SLStore' || (secret && await this.writeAt(REG_ROOT_HKCU, 'SLStore', secret)))
+          && await this.writeAt(REG_ROOT_HKCU, name, data)) {
+        this.selectedRoot = REG_ROOT_HKCU;
         return true;
       }
     }

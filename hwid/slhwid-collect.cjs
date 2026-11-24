@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * §4A.1 factor collection per platform. The legacy slots reuse the shared
+ * SL-HWID factor collection per platform. The legacy slots reuse the shared
  * hwid collector on Windows and Linux; the extended slots come from the
  * registry, environment, os, and best-effort subprocess queries. Every
  * source degrades gracefully — a missing source just leaves the slot
@@ -11,6 +11,8 @@
 const { execFile } = require('child_process');
 const fs = require('fs');
 const os = require('os');
+
+const { joinInstances } = require('./slhwid-core.cjs');
 
 const DISPLAY_CLASS_GUID = '{4d36e968-e325-11ce-bfc1-08002be10318}';
 
@@ -42,7 +44,7 @@ function allMatches(pattern, text, flags = 'g') {
 }
 
 function multiInstance(values) {
-  return values.filter((v) => v).sort().join('|');
+  return joinInstances(values);
 }
 
 function put(factors, name, value) {
@@ -185,13 +187,24 @@ async function collectWindows() {
   // CIM-backed v2 signals deliberately supplement rather than replace the
   // legacy collection above: v1 helpers still recover from those raw slots.
   const script = [
+    // UTF-8 output keeps non-ASCII hardware strings identical to the other
+    // implementations, which set the same encoding.
+    '[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);$OutputEncoding=[Console]::OutputEncoding',
     "$ErrorActionPreference='SilentlyContinue'",
     "function Emit($n,$v){$c=@($v|Where-Object {$_ -ne $null -and ([string]$_).Trim().Length -gt 0}|ForEach-Object {([string]$_).Trim()}|Sort-Object);if($c.Count -gt 0){Write-Output ($n+'='+($c -join '|'))}}",
     "$p=Get-CimInstance Win32_ComputerSystemProduct;Emit 'system_uuid' $p.UUID;Emit 'system_serial' $p.IdentifyingNumber",
     "Emit 'chassis_serial' (Get-CimInstance Win32_SystemEnclosure).SerialNumber",
     "Emit 'disk_serial' (Get-CimInstance Win32_DiskDrive).SerialNumber",
+    // Schema v3 fixed disks leave out USB (7), SD (12), MMC (13) and mounted
+    // images (15), as Windows' STORAGE_BUS_TYPE numbers them.
+    "Emit 'fixed_disk_serial' (Get-CimInstance -Namespace root/Microsoft/Windows/Storage MSFT_PhysicalDisk|?{$_.BusType -notin 7,12,13,15}).SerialNumber",
     "Emit 'memory_modules' (Get-CimInstance Win32_PhysicalMemory).SerialNumber",
-    "Emit 'nic_identity' (Get-CimInstance Win32_NetworkAdapter|Where-Object {$_.PhysicalAdapter}).PermanentAddress",
+    // Win32_NetworkAdapter.PermanentAddress is normally empty. It stays first
+    // so any value it did provide keeps its enrolled form; MSFT_NetAdapter
+    // supplies it otherwise.
+    "$n=@((Get-CimInstance Win32_NetworkAdapter|?{$_.PhysicalAdapter}).PermanentAddress|?{$_})",
+    "if($n.Count -eq 0){$n=(Get-CimInstance -Namespace root/StandardCimv2 MSFT_NetAdapter|?{$_.ConnectorPresent -and -not $_.Virtual}).PermanentAddress}",
+    "Emit 'nic_identity' $n",
     "Emit 'battery_serial' (Get-CimInstance -Namespace root/wmi -ClassName BatteryStaticData).SerialNumber",
     "$ek=Get-TpmEndorsementKeyInfo -HashAlgorithm Sha256;if($ek.IsPresent){Emit 'tpm_ek' $ek.PublicKeyHash}",
   ].join(';');
@@ -273,19 +286,27 @@ async function collectDarwin() {
   const displays = await run('system_profiler', ['SPDisplaysDataType', '-json'], 5000);
   const models = allMatches('"spdisplays_model"\\s*:\\s*"([^"]+)"', displays.stdout);
   if (models.length > 0) {
-    factors.gpu_id = [...models].sort().join('|');
+    factors.gpu_id = joinInstances(models);
   }
 
   const storage = await run('system_profiler', ['SPStorageDataType', '-json'], 5000);
   const diskSerials = allMatches('"[a-z_]*serial[a-z_]*"\\s*:\\s*"([^"]+)"', storage.stdout);
   if (diskSerials.length > 0) {
-    factors.disk_serial = [...diskSerials].sort().join('|');
+    factors.disk_serial = joinInstances(diskSerials);
+  }
+
+  // Schema v3 fixed disks: only internal NVMe/SATA buses are listed here;
+  // USB storage appears under SPUSBDataType instead.
+  const internalStorage = await run('system_profiler', ['SPNVMeDataType', 'SPSerialATADataType', '-json'], 5000);
+  const fixedSerials = allMatches('"device_serial"\\s*:\\s*"([^"]+)"', internalStorage.stdout);
+  if (joinInstances(fixedSerials)) {
+    factors.fixed_disk_serial = joinInstances(fixedSerials);
   }
 
   const displayIO = await run('ioreg', ['-r', '-c', 'IODisplayConnect']);
   const blobs = allMatches('"IODisplayEDID"\\s*=\\s*<?([0-9a-fA-F]+)>?', displayIO.stdout);
   if (blobs.length > 0) {
-    factors.monitor_edid = blobs.map((b) => b.toLowerCase()).sort().join('|');
+    factors.monitor_edid = joinInstances(blobs.map((b) => b.toLowerCase()));
   }
 
   const version = (await run('sw_vers', ['-productVersion'])).stdout.trim();
@@ -397,10 +418,43 @@ async function collectLinux() {
     }
   } catch { /* absent */ }
 
+  // Schema v3 fixed disks: every block device with a serial that is neither
+  // marked removable nor attached through USB. NVMe/SCSI expose
+  // device/serial; virtio exposes serial on the block device itself.
+  const fixedDisks = [];
+  let blockDevices = [];
+  try {
+    blockDevices = fs.readdirSync('/sys/block');
+  } catch { /* absent */ }
+  for (const name of blockDevices.sort()) {
+    const base = `/sys/block/${name}`;
+    try {
+      if (fs.readFileSync(`${base}/removable`, 'utf8').trim() === '1') {
+        continue;
+      }
+    } catch { /* no removable flag */ }
+    try {
+      if (fs.realpathSync(base).includes('/usb')) {
+        continue;
+      }
+    } catch { /* unresolvable link */ }
+    for (const file of [`${base}/device/serial`, `${base}/serial`]) {
+      try {
+        const serial = fs.readFileSync(file, 'utf8').trim();
+        if (serial) {
+          fixedDisks.push(serial);
+          break;
+        }
+      } catch { /* absent */ }
+    }
+  }
+  put(factors, 'fixed_disk_serial', joinInstances(fixedDisks));
+
   let edids = [];
   try {
     edids = fs.readdirSync('/sys/class/drm')
-      .filter((name) => /^card\d+-\d+$/.test(name))
+      // Connector names look like card0-HDMI-A-1, as the other implementations accept.
+      .filter((name) => name.startsWith('card') && name.includes('-'))
       .map((name) => `/sys/class/drm/${name}/edid`)
       .filter((file) => fs.existsSync(file));
   } catch { /* absent */ }
@@ -414,7 +468,7 @@ async function collectLinux() {
     } catch { /* absent */ }
   }
   if (blobs.length > 0) {
-    factors.monitor_edid = blobs.sort().join('|');
+    factors.monitor_edid = joinInstances(blobs);
   }
 
   const gpus = [];
@@ -434,7 +488,7 @@ async function collectLinux() {
     } catch { /* absent */ }
   }
   if (gpus.length > 0) {
-    factors.gpu_id = gpus.sort().join('|');
+    factors.gpu_id = joinInstances(gpus);
   }
 
   return factors;

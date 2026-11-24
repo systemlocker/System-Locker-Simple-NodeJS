@@ -5,7 +5,6 @@ const { googleSsoUrl } = require('./sso');
 
 const AUTH_PATH = '/auth';
 const VARIABLE_PATH = '/auth/variable';
-const API_V1_PATH = '/api/v1';
 
 const RESET_GRANTED = 'granted';
 const RESET_DENIED = 'denied';
@@ -23,7 +22,7 @@ function defaultConfig() {
     requestTimeoutMs: 15_000,
     baseUrl: 'https://systemlocker.net',
     invisibleFolderBaseUrl: 'https://invisiblefolder.net',
-    userAgent: 'systemlocker-simple-node/1.2.0',
+    userAgent: 'systemlocker-simple-node/2.0.0',
     programDigest: null,
     invisibleFolderApiKey: null,
     apiKey: null,
@@ -256,7 +255,7 @@ class Client {
     }
   }
 
-  /** The management sub-API (POST /api/v1). Requires config.apiKey. */
+  /** The management sub-API (Management API v2). Requires config.apiKey. */
   management() {
     if (this._management === undefined) {
       const { Management } = require('./management');

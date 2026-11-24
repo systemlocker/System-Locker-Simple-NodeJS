@@ -2,9 +2,7 @@
 
 const { SimpleError, ErrorKind } = require('./errors');
 
-const API_V1_PATH = '/api/v1';
-
-/** Expiry presets the server understands. */
+/** Key-generation expiry presets. Duration presets start at redemption. */
 const Expiry = Object.freeze({
   Permanent: '0',
   OneDay: '1',
@@ -14,10 +12,27 @@ const Expiry = Object.freeze({
   OneYear: '5',
 });
 
+// Duration in seconds for each Expiry preset, indexed by its value.
+// Index 0 (permanent) is never sent as a duration.
+const PRESET_SECONDS = [0, 86400, 604800, 2592000, 7776000, 31536000];
+const METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'];
+
+// Reads a required field from a response's data object. A missing field and
+// an invalid value are both protocol errors rather than silent defaults.
+function field(data, name, valid) {
+  if (!data || typeof data !== 'object' || !Object.hasOwn(data, name) || !valid(data[name])) {
+    throw new SimpleError(ErrorKind.Transport, `invalid management field: ${name}`);
+  }
+  return data[name];
+}
+
+const isStringArray = (value) => Array.isArray(value) && value.every((item) => typeof item === 'string');
+const isNullableString = (value) => value === null || typeof value === 'string';
+
 /**
- * Wraps POST /api/v1: key status/expiration, HWID resets, key generation,
- * bans, expiry adjustment. Independent of the auth protocol; meant for
- * server-side tooling. Requires config.apiKey — treat it as a secret.
+ * Wraps the Management API v2 (/api/v2). Independent of the authentication
+ * protocol; meant for server-side tooling. config.apiKey must hold a scoped
+ * v2 bearer credential for this system — treat it as a secret.
  */
 class Management {
   /** @param {import('./client').Client} client */
@@ -25,86 +40,141 @@ class Management {
     this.client = client;
   }
 
-  async post(fields) {
-    if (!this.client.config.apiKey) {
-      throw new SimpleError(ErrorKind.Configuration, 'management API key not configured');
-    }
-    return this.client.request(API_V1_PATH, { ...fields, key: this.client.config.apiKey });
+  get systemPath() {
+    return `/systems/${encodeURIComponent(this.client.config.systemId)}`;
   }
 
-  /** Number of redeemed keys for the system. */
-  async redeemedUserCount() {
-    const { body } = await this.post({ select: 'users' });
-    const count = Number.parseInt(body, 10);
-    if (!Number.isSafeInteger(count) || String(count) !== body) {
-      throw new SimpleError(ErrorKind.UnknownReason, `non-numeric users response: ${body}`, body);
-    }
-    return count;
-  }
-
-  /** Redemption status of a license key (server-defined string). */
-  async keyStatus(license) {
-    const { body } = await this.post({ select: 'key', lkey: license });
-    return body;
-  }
-
-  /** Expiration date of a license key. */
-  async keyExpiration(license) {
-    const { body } = await this.post({ select: 'expiration', lkey: license });
-    const lower = body.toLowerCase();
-    return { permanent: lower === 'permanent' || lower === 'never' || body === '0', expiresAt: body };
-  }
-
-  /** Resets the HWID of one key. asAdmin=false enforces the 30-day cooldown. */
-  async resetHwid(license, asAdmin = true) {
-    const fields = { command: 'hwidreset', license };
-    if (!asAdmin) {
-      fields.as_admin = 'false';
-    }
-    const { body } = await this.post(fields);
-    return body;
-  }
-
-  /** Resets the HWID of every key in the system. Use with care. */
-  async resetAllHwids() {
-    const { body } = await this.post({ command: 'systemhwidreset' });
-    return body;
+  keyPath(license) {
+    return `${this.systemPath}/keys/${encodeURIComponent(license)}`;
   }
 
   /**
-   * Generates count (1–100) keys with an expiry preset, optionally
-   * annotated with a note (≤250 characters). Returns the raw body
-   * (typically the keys, one per line).
+   * Calls any v2 resource path (relative to /api/v2, e.g. '/permissions' or
+   * '/systems/{id}/nightflyer') and returns the response's JSON `data`.
+   * POST/PUT/PATCH without data send an empty JSON object. A non-2xx
+   * response throws a SimpleError whose `reason` is the server's error code
+   * (e.g. 'INSUFFICIENT_SCOPE'). Mutations are never retried.
+   */
+  async request(method, path, data) {
+    const credential = this.client.config.apiKey;
+    if (!credential || /[\r\n]/.test(credential)) {
+      throw new SimpleError(ErrorKind.Configuration, 'a management bearer credential is required');
+    }
+    if (!METHODS.includes(method) || typeof path !== 'string' || !path.startsWith('/') || path.startsWith('//') || path.includes('#')) {
+      throw new SimpleError(ErrorKind.Configuration, 'invalid management method or resource path');
+    }
+    const transport = this.client.transport;
+    if (typeof transport.requestJson !== 'function') {
+      throw new SimpleError(ErrorKind.Configuration, 'HTTP client must implement requestJson for management');
+    }
+    const headers = { Authorization: `Bearer ${credential}`, Accept: 'application/json' };
+    // The server requires a JSON Content-Type on every mutation, even one
+    // without fields.
+    const body = data === undefined && ['POST', 'PUT', 'PATCH'].includes(method) ? {} : data;
+    const response = await transport.requestJson(method, this.client.endpoint('/api/v2' + path), body, headers);
+    if (response.error) throw new SimpleError(ErrorKind.Transport, String(response.error));
+    let payload;
+    try {
+      payload = JSON.parse(Buffer.from(response.body).toString('utf8'));
+    } catch {
+      throw new SimpleError(ErrorKind.Transport, `management returned invalid JSON (HTTP ${response.status})`);
+    }
+    if (response.status < 200 || response.status >= 300) {
+      const detail = payload && typeof payload.error === 'object' && payload.error !== null ? payload.error : {};
+      const message = typeof detail.message === 'string' && detail.message ? detail.message : `management HTTP ${response.status}`;
+      throw new SimpleError(ErrorKind.Transport, message, typeof detail.code === 'string' ? detail.code : '');
+    }
+    if (!payload || typeof payload !== 'object' || !Object.hasOwn(payload, 'data')) {
+      throw new SimpleError(ErrorKind.UnknownReason, 'management response is missing data');
+    }
+    return payload.data;
+  }
+
+  /** Scopes granted to the configured credential. Requires no scope. */
+  async permissions() {
+    return field(await this.request('GET', '/permissions'), 'scopes', isStringArray);
+  }
+
+  /**
+   * The system's user count (accounts plus key-only redemptions). The server
+   * refreshes it periodically, so it can lag behind recent redemptions.
+   * Requires systems.read.
+   */
+  async redeemedUserCount() {
+    return field(await this.request('GET', this.systemPath + '/statistics'), 'total_users',
+      (value) => Number.isSafeInteger(value) && value >= 0);
+  }
+
+  /**
+   * How a key is claimed: 'user' (attached to an account), 'mikros'
+   * (redeemed without an account) or 'unclaimed'. Requires keys.read.
+   */
+  async keyStatus(license) {
+    return field(await this.request('GET', this.keyPath(license)), 'claim_type', (value) => typeof value === 'string');
+  }
+
+  /**
+   * A key's expiry. `expiresAt` is an RFC 3339 UTC timestamp, or '' when the
+   * key has no fixed expiry. `permanent` is only reported for redeemed keys:
+   * an unredeemed duration key has no timestamp yet either. Requires keys.read.
+   */
+  async keyExpiration(license) {
+    const data = await this.request('GET', this.keyPath(license));
+    const expiry = field(data, 'expires_at', isNullableString);
+    const redeemed = field(data, 'redeemed_at', isNullableString);
+    return { permanent: expiry === null && redeemed !== null, expiresAt: expiry ?? '' };
+  }
+
+  /**
+   * Administrative HWID reset of one key (no cooldown). Returns the key's
+   * details as JSON text. Self-service resets use client.resetHwidForKey.
+   * Requires keys.update.
+   */
+  async resetHwid(license) {
+    return JSON.stringify(await this.request('POST', this.keyPath(license) + '/hwid-reset'));
+  }
+
+  /** Resets every key's HWID; returns '{"updated":count}'. Use with care. Requires keys.update. */
+  async resetAllHwids() {
+    return JSON.stringify(await this.request('POST', this.systemPath + '/keys/hwid-reset'));
+  }
+
+  /**
+   * Generates count (1–100) keys with an Expiry preset, optionally annotated
+   * with a note (≤250 characters). Returns the keys one per line. Duration
+   * presets start at redemption. Requires keys.create.
    */
   async generateKeys(expiry, count, note = '') {
-    if (!Number.isSafeInteger(count) || count < 1 || count > 100) {
+    if (!Number.isInteger(count) || count < 1 || count > 100) {
       throw new SimpleError(ErrorKind.Configuration, 'count must be in [1, 100]');
     }
-    if (note.length > 250) {
+    if ([...note].length > 250) {
       throw new SimpleError(ErrorKind.Configuration, 'note must be at most 250 characters');
     }
-    const fields = { command: 'genkeys', expire: expiry, count: String(count) };
-    if (note) {
-      fields.note = note;
+    if (!/^[0-5]$/.test(String(expiry))) {
+      throw new SimpleError(ErrorKind.Configuration, 'invalid expiry preset');
     }
-    const { body } = await this.post(fields);
-    return body;
+    const seconds = PRESET_SECONDS[Number(expiry)];
+    const policy = seconds ? { type: 'after_redemption', seconds } : { type: 'perpetual' };
+    const data = await this.request('POST', this.systemPath + '/keys', { count, notes: note, expiry: policy });
+    return field(data, 'keys', isStringArray).join('\n');
   }
 
-  /** Permanently deletes a key. */
+  /** Permanently deletes a key; returns '{"deleted":true}'. Requires keys.delete. */
   async banKey(license) {
-    const { body } = await this.post({ command: 'bankey', license });
-    return body;
+    return JSON.stringify(await this.request('DELETE', this.keyPath(license)));
   }
 
   /**
-   * Adjusts a key's expiry. newExpiry is a date the server understands
-   * (e.g. "2026-12-31") or "0" for permanent. tz is an IANA timezone such
-   * as "America/Chicago".
+   * Extends a key's expiry by a positive number of seconds; returns the key's
+   * details as JSON text. Replaces the retired absolute-expiry adjustment,
+   * which has no v2 equivalent. Requires keys.update.
    */
-  async adjustExpiry(license, newExpiry, tz) {
-    const { body } = await this.post({ command: 'adjustexpiry', license, newexpiry: newExpiry, tz });
-    return body;
+  async addTime(license, seconds) {
+    if (!Number.isSafeInteger(seconds) || seconds <= 0) {
+      throw new SimpleError(ErrorKind.Configuration, 'seconds must be a positive integer');
+    }
+    return JSON.stringify(await this.request('POST', this.keyPath(license) + '/time', { seconds }));
   }
 }
 

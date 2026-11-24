@@ -11,10 +11,10 @@ class FetchHttpClient {
    */
   constructor(options = {}) {
     this.requestTimeoutMs = options.requestTimeoutMs ?? 15_000;
-    this.userAgent = options.userAgent ?? 'systemlocker-simple-node/1.2.0';
+    this.userAgent = options.userAgent ?? 'systemlocker-simple-node/2.0.0';
   }
 
-  async _execute(method, url, { form = null, headers = {} } = {}) {
+  async _execute(method, url, { form = null, json = undefined, headers = {} } = {}) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.requestTimeoutMs);
     try {
@@ -25,6 +25,10 @@ class FetchHttpClient {
       if (form) {
         fetchOptions.headers['Content-Type'] = 'application/x-www-form-urlencoded';
         fetchOptions.body = new URLSearchParams(form).toString();
+      }
+      if (json !== undefined) {
+        fetchOptions.headers['Content-Type'] = 'application/json';
+        fetchOptions.body = JSON.stringify(json);
       }
       const response = await fetch(url, fetchOptions);
       const body = await readBoundedBody(response, controller);
@@ -47,6 +51,19 @@ class FetchHttpClient {
    */
   postForm(url, form, headers = {}) {
     return this._execute('POST', url, { form, headers });
+  }
+
+  /**
+   * Sends a Management API request. `json`, when not undefined, is
+   * serialized as the body with Content-Type: application/json.
+   * Authentication keeps using postForm.
+   * @param {string} method
+   * @param {string} url
+   * @param {unknown} json
+   * @param {Record<string, string>} [headers]
+   */
+  requestJson(method, url, json, headers = {}) {
+    return this._execute(method, url, { json, headers });
   }
 
   /**

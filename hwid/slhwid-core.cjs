@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Pure cryptographic core of the §4A secret-sharing HWID module: GF(2^61-1)
+ * Pure cryptographic core of the fault-tolerant secret-sharing HWID module: GF(2^61-1)
  * arithmetic on BigInt, four-limb secret sharing, x-derivation, helper-blob
  * serialization, recovery and refresh. Platform-free; the lifecycle in
  * ss.cjs wires it to collectors, storage and the CSPRNG.
@@ -157,7 +157,8 @@ const PLACEHOLDERS = new Set([
 
 const IDENTIFIER_FACTORS = new Set([
   'machine_guid', 'product_uuid', 'system_uuid', 'board_serial', 'system_serial', 'chassis_serial',
-  'disk_serial', 'volume_id', 'tpm_ek', 'memory_modules', 'nic_identity', 'battery_serial', 'monitor_edid',
+  'disk_serial', 'fixed_disk_serial', 'volume_id', 'tpm_ek', 'memory_modules', 'nic_identity', 'battery_serial',
+  'monitor_edid',
 ]);
 
 function normalize(name, raw) {
@@ -210,11 +211,50 @@ function normalizeFactors(raw) {
       out[name] = nv;
     }
   }
+  // Derived, never collected: a supplied value is always replaced.
+  delete out.edid_digests;
+  if (Object.prototype.hasOwnProperty.call(raw, 'monitor_edid')) {
+    const digests = edidDigests(normalize('monitor_edid', raw.monitor_edid));
+    if (digests && isSaneFactor('edid_digests', digests)) {
+      out.edid_digests = digests;
+    }
+  }
   return out;
 }
 
+/**
+ * Schema v3's display signal: one SHA-256 per usable monitor_edid member,
+ * sorted. Windows keeps the EDID of every monitor ever attached, and the hex
+ * inventory regularly exceeds the 4096-byte factor limit; the digests stay
+ * small. They are derived before that limit drops monitor_edid.
+ */
+function edidDigests(normalized) {
+  if (Buffer.byteLength(normalized, 'utf8') > 1024 * 1024) {
+    return ''; // bound the hashing work on untrusted input
+  }
+  return normalized.split('|')
+    .filter((part) => !isMissing(part) && !isDegenerateIdentifier(part))
+    .map((part) => crypto.createHash('sha256').update(part, 'utf8').digest('hex'))
+    .sort()
+    .join('|');
+}
+
+/**
+ * The canonical multi-instance form shared by every implementation: each
+ * member is trimmed of ASCII whitespace, empty members are dropped, and the
+ * rest are sorted by UTF-16 code unit and joined with "|".
+ */
+function joinInstances(values) {
+  return [...values]
+    .map((value) => String(value).replace(/^[ \t\n\v\f\r]+|[ \t\n\v\f\r]+$/g, ''))
+    .filter((value) => value)
+    .sort()
+    .join('|');
+}
+
 const LEGACY_NORM_VERSION = 1;
-const CURRENT_NORM_VERSION = 2;
+const V2_NORM_VERSION = 2;
+const CURRENT_NORM_VERSION = 3;
 
 // These names are historical compatibility data. Do not change this list:
 // schema-v1 helpers need the exact slots they were enrolled against.
@@ -223,16 +263,35 @@ const LEGACY_FACTOR_NAMES = Object.freeze([
   'ram_total', 'volume_id', 'computer_name', 'firmware', 'gpu_id', 'monitor_edid', 'os_build',
 ]);
 
-const CURRENT_DIRECT_FACTOR_NAMES = Object.freeze([
+// Schema v2 is historical compatibility code: v2 helpers recover with it.
+const V2_DIRECT_FACTOR_NAMES = Object.freeze([
   'slstore', 'machine_guid', 'cpu_id', 'disk_serial', 'ram_total', 'volume_id', 'firmware',
+  'tpm_ek', 'memory_modules', 'nic_identity', 'battery_serial',
+]);
+
+const V2_FACTOR_GROUPS = Object.freeze([
+  ['platform_identity', ['system_uuid', 'board_serial', 'system_serial', 'chassis_serial']],
+  ['display_group', ['gpu_id', 'monitor_edid']],
+  ['software_environment', ['computer_name', 'os_build']],
+]);
+
+// Schema v3: fixed_disk_serial leaves out removable, USB and image-backed
+// disks, and display_group uses per-monitor EDID digests.
+const CURRENT_DIRECT_FACTOR_NAMES = Object.freeze([
+  'slstore', 'machine_guid', 'cpu_id', 'fixed_disk_serial', 'ram_total', 'volume_id', 'firmware',
   'tpm_ek', 'memory_modules', 'nic_identity', 'battery_serial',
 ]);
 
 const CURRENT_FACTOR_GROUPS = Object.freeze([
   ['platform_identity', ['system_uuid', 'board_serial', 'system_serial', 'chassis_serial']],
-  ['display_group', ['gpu_id', 'monitor_edid']],
+  ['display_group', ['gpu_id', 'edid_digests']],
   ['software_environment', ['computer_name', 'os_build']],
 ]);
+
+const GROUPED_SCHEMAS = Object.freeze({
+  [V2_NORM_VERSION]: [V2_DIRECT_FACTOR_NAMES, V2_FACTOR_GROUPS],
+  [CURRENT_NORM_VERSION]: [CURRENT_DIRECT_FACTOR_NAMES, CURRENT_FACTOR_GROUPS],
+});
 
 function groupValue(name, members, raw) {
   const hash = crypto.createHash('sha256');
@@ -264,15 +323,16 @@ function projectFactors(raw, normVersion) {
     }
     return output;
   }
-  if (normVersion !== CURRENT_NORM_VERSION) {
+  if (!GROUPED_SCHEMAS[normVersion]) {
     throw new SsError(`slhwid: unsupported factor schema ${normVersion}`);
   }
-  for (const name of CURRENT_DIRECT_FACTOR_NAMES) {
+  const [directNames, groups] = GROUPED_SCHEMAS[normVersion];
+  for (const name of directNames) {
     if (raw[name]) {
       output[name] = raw[name];
     }
   }
-  for (const [name, members] of CURRENT_FACTOR_GROUPS) {
+  for (const [name, members] of groups) {
     const value = groupValue(name, members, raw);
     if (value) {
       output[name] = value;
@@ -285,11 +345,14 @@ function currentMandatoryName(name) {
   if (['product_uuid', 'board_serial', 'system_uuid', 'system_serial', 'chassis_serial'].includes(name)) {
     return 'platform_identity';
   }
-  if (name === 'gpu_id' || name === 'monitor_edid') {
+  if (name === 'gpu_id' || name === 'monitor_edid' || name === 'edid_digests') {
     return 'display_group';
   }
   if (name === 'computer_name' || name === 'os_build') {
     return 'software_environment';
+  }
+  if (name === 'disk_serial') {
+    return 'fixed_disk_serial';
   }
   return name === 'mac' ? 'nic_identity' : name;
 }
@@ -397,7 +460,7 @@ function parseHelper(blob) {
   if (body[0] !== 1) {
     throw corrupt(`unsupported version ${body[0]}`);
   }
-  if (body[1] !== LEGACY_NORM_VERSION && body[1] !== CURRENT_NORM_VERSION) {
+  if (body[1] !== LEGACY_NORM_VERSION && !GROUPED_SCHEMAS[body[1]]) {
     throw corrupt(`unsupported factor schema ${body[1]}`);
   }
   if (body[6] !== 0 || body[7] !== 0) {
@@ -405,7 +468,7 @@ function parseHelper(blob) {
   }
   const allowed = new Set(body[1] === LEGACY_NORM_VERSION
     ? LEGACY_FACTOR_NAMES
-    : [...CURRENT_DIRECT_FACTOR_NAMES, ...CURRENT_FACTOR_GROUPS.map(([name]) => name)]);
+    : [...GROUPED_SCHEMAS[body[1]][0], ...GROUPED_SCHEMAS[body[1]][1].map(([name]) => name)]);
   const helper = { normVersion: body[1], salt: body[2], threshold: body[5], checkWord: cw, slots: [] };
   const n = body[3];
   const mandatoryHeader = body[4];
@@ -681,7 +744,9 @@ module.exports = {
   normalize,
   normalizeFactors,
   LEGACY_NORM_VERSION,
+  V2_NORM_VERSION,
   CURRENT_NORM_VERSION,
+  joinInstances,
   LEGACY_FACTOR_NAMES,
   CURRENT_DIRECT_FACTOR_NAMES,
   CURRENT_FACTOR_GROUPS,

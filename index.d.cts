@@ -23,6 +23,8 @@ declare namespace Simple {
   interface HTTPClient {
     postForm(url: string, form: Record<string, string | string[]>, headers?: Record<string, string>): Promise<HttpResponse>;
     get(url: string, headers?: Record<string, string>): Promise<HttpResponse>;
+    /** Required by management; authentication continues to use postForm. */
+    requestJson?(method: string, url: string, data: unknown, headers: Record<string, string>): Promise<HttpResponse>;
   }
 
   interface SimpleConfig {
@@ -113,14 +115,16 @@ declare namespace Simple {
   type KeyExpiry = '0' | '1' | '2' | '3' | '4' | '5';
 
   class Management {
+    request<T = unknown>(method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE', path: string, data?: unknown): Promise<T>;
+    permissions(): Promise<string[]>;
     redeemedUserCount(): Promise<number>;
     keyStatus(license: string): Promise<string>;
     keyExpiration(license: string): Promise<Expiration>;
-    resetHwid(license: string, asAdmin?: boolean): Promise<string>;
+    resetHwid(license: string): Promise<string>;
     resetAllHwids(): Promise<string>;
     generateKeys(expiry: KeyExpiry, count: number, note?: string): Promise<string>;
     banKey(license: string): Promise<string>;
-    adjustExpiry(license: string, newExpiry: string, tz: string): Promise<string>;
+    addTime(license: string, seconds: number): Promise<string>;
   }
 
   function defaultConfig(): Required<SimpleConfig>;
