@@ -2,6 +2,7 @@
   "name": "systemlocker-simple",
   "version": "2.0.0",
   "description": "Official System Locker Simple client for Node.js. Performs stateless license checks over POST /auth, for software on machines you control.",
+  "license": "SEE LICENSE IN LICENSE",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/systemlocker/System-Locker-Simple-NodeJS.git"
